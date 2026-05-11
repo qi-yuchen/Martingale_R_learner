@@ -1,0 +1,1374 @@
+---
+title: "Simulation"
+author: "Yuchen Qi"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# For all code files
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(survival)
+library(gam)
+library(polspline)
+library(caret)
+
+cproduct = function(m1, m2) {
+  m1_ncol = ncol(m1)
+  m1_colname = colnames(m1)
+  m2_ncol = ncol(m2)
+  m2_colname = colnames(m2)
+  cpro = NULL
+  for (i in 1:m1_ncol) {
+    matrix = m1[, i]*m2
+    colnames(matrix) = paste(m1_colname[i], "*", m2_colname, sep = "")
+    cpro = cbind(cpro, matrix)
+  }
+  cpro
+}
+```
+
+# Setup A
+
+```{r debug, eval=FALSE}
+b0 = 1/2
+n = 100000
+
+f.uniroot = function(t, a, b, c, d) {
+  a*t^3 + b*t^2 + c*t + d
+}
+
+df = data.frame(id = 1:n,  
+                z2 = runif(n, -2, 2),
+                trt = rbinom(n, 1, 0.5), 
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 8.5)) %>% 
+  rowwise() %>%
+  mutate(a = 1/3,
+         b = 1/2,
+         c = b0 + z2 + z2^2,
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+mean(df$observedevent)
+quantile(df$observedtime, 0.85)
+```
+
+replace t85, b0, f.uniroot, and df
+
+```{r data}
+#set.seed(1)
+result.all = rep(0,2)
+names(result.all) = c("estimated mse", "oracle mse")
+
+t85 = 1.922834
+b0 = 1/2
+n = 500
+
+m.trt0 = tibble(trt = 0)
+m.trt1 = tibble(trt = 1)
+
+# f for uniroot
+f.uniroot = function(t, a, b, c, d) {
+  a*t^3 + b*t^2 + c*t + d
+}
+
+df = data.frame(id = 1:n,  
+                z2 = runif(n, -2, 2),
+                trt = rbinom(n, 1, 0.5), 
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 8.5)) %>% 
+  rowwise() %>%
+  mutate(a = 1/3,
+         b = 1/2,
+         c = b0 + z2 + z2^2,
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+# CV folds, used in glmnet, ridge or lasso
+K = 5 # K folds for CV
+cvSplits = createFolds(df$observedevent, k = K, list = F)
+# Add fold id for CV
+df = df %>% cbind(cvSplits)
+# Cross-fitting folds
+Q = 5 # Q folds for cross-fitting
+cfSplits = createFolds(df$observedevent, k = Q, list = F)
+# Add fold id for cross-fitting
+df = df %>% cbind(cfSplits)
+
+# clean df
+df.raw = df
+df = df %>%
+  dplyr::select(
+    id,
+    z2,
+    trt,
+    observedtime,
+    observedevent,
+    cvSplits,
+    cfSplits
+  )
+  
+
+# t_k vector
+t.vector = df %>% 
+  dplyr::filter(observedevent == 1) %>% 
+  pull(observedtime)
+delta_t.vector = t.vector - lag(t.vector, default = 0)
+```
+
+# Test data
+
+```{r}
+set.seed(1234)
+
+test.data = data.frame(id = 1:n,  
+                z2 = runif(n, -2, 2),
+                trt = rbinom(n, 1, 0.5), 
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 8.5)) %>% 
+  rowwise() %>%
+  mutate(a = 1/3,
+         b = 1/2,
+         c = b0 + z2 + z2^2,
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+
+set.seed(NULL)
+```
+
+# Continue
+
+## estimated
+
+change covariates, basis, truth
+
+```{r estimated}
+########################### estimated 
+# estimated nuisance models
+# Q estimated models
+hazard_m.list = vector("list", Q)
+pi_hat.list = vector("list", Q)
+surv_c.list = vector("list", Q)
+for (q in 1:Q) {
+  df.m = df %>% 
+    dplyr::filter(cfSplits!=q) %>% 
+    as.matrix()
+  hazard_m.list[[q]] = hare(df.m[,"observedtime"],
+                        df.m[,"observedevent"],
+                        df.m[,c("z2")])
+  pi_hat.list[[q]] = gam(trt ~ s(z2,3),
+                     data = df %>% 
+    dplyr::filter(cfSplits!=q), family = "binomial")
+  surv_c.list[[q]] = hare(df.m[,"observedtime"], df.m[,"observedevent"],
+                      df.m[, c("z2", "trt")])
+}
+
+# put all subjects together
+df.pseudo = NULL
+for (i in 1:n) {
+  df.id = df %>% 
+    dplyr::filter(id == i) %>% 
+    tibble(k = 1:length(t.vector), t_k = t.vector, delta_t = delta_t.vector) %>% 
+    dplyr::filter(t_k <= observedtime) %>% 
+    mutate(counting = if_else(observedevent == 1 & t_k == observedtime, 1, 0))
+  if (nrow(df.id) == 0)
+    next
+  
+  survival.id = 1-phare(df.id$t_k, df.id[1,c("z2")], hazard_m.list[[df.id$cfSplits[1]]])
+  survival0.id = 1-phare(df.id$t_k, c(df.id[1,c("z2")], m.trt0), surv_c.list[[df.id$cfSplits[1]]])
+  survival1.id = 1-phare(df.id$t_k, c(df.id[1,c("z2")], m.trt1), surv_c.list[[df.id$cfSplits[1]]])
+  pi.id = predict.glm(pi_hat.list[[df.id$cfSplits[1]]], 
+                      newdata = tibble(
+                                       z2 = df.id$z2[1]), 
+                      type = "response")
+  
+  df.id = df.id %>% 
+    mutate(survival_tk = survival.id,
+           survival0 = survival0.id,
+           survival1 = survival1.id,
+           pi = pi.id)
+  
+  df.pseudo = rbind(df.pseudo, df.id)
+}
+# add calculations
+eps = 1e-8
+df.pseudo3 = df.pseudo %>% 
+  mutate(
+    survival_tk = pmin(pmax(survival_tk, eps), 1 - eps),
+    survival0 = pmin(pmax(survival0, eps), 1 - eps),
+    survival1 = pmin(pmax(survival1, eps), 1 - eps)
+  ) %>%
+  group_by(id) %>%
+  arrange(k, .by_group = TRUE) %>%
+  mutate(
+    t_k_pre = lag(t_k, default = 0),
+    rho = pi * survival1 / survival0 / 
+      (1 + (survival1 / survival0 - 1) * pi),
+    Lambda_tk = -log(survival_tk),
+    Lambda_tkpre = lag(Lambda_tk, default = 0),
+    Lambda_delta = Lambda_tk - Lambda_tkpre
+  ) %>%
+  ungroup()
+
+# pseudo y
+y.pseudo = (df.pseudo3$counting -
+              df.pseudo3$Lambda_delta)/df.pseudo3$delta_t
+
+#### spline basis and ridge
+### using pseudo data for knots
+t.basis = splines::ns(df.pseudo3$t_k,df=10)
+z2.basis = splines::ns(df.pseudo3$z2,df=7)
+# combine two basis and add interaction
+x.basis = cbind(t.basis, z2.basis)
+X_ns = cbind(x.basis, cproduct(t.basis, z2.basis))
+colnames(X_ns) = paste("x", 1:ncol(X_ns), sep = "")
+x.pseudo = (df.pseudo3$trt - df.pseudo3$rho)*cbind(1, X_ns)
+penalty_factor_tau = c(0, rep(1, ncol(X_ns)))
+
+### Target estimation-ridge
+finalRidge = glmnet::cv.glmnet(x = x.pseudo, 
+                               y = y.pseudo,
+                               penalty.factor = penalty_factor_tau,
+                               intercept = FALSE,
+                               standardize = F,
+                               alpha  = 0,
+                               weights = df.pseudo3$delta_t,
+                               nfolds = 5,
+                               foldid = df.pseudo3$cvSplits
+)
+tau_beta = as.vector(coef(finalRidge, 
+                          s=finalRidge$lambda.min))[-1]
+
+# MSE
+df.sample = test.data %>% 
+  dplyr::filter(observedtime<=t85)
+z.sample = df.sample$z2
+t.sample = df.sample$observedtime
+tau0 = z.sample+t.sample+
+  (z.sample)^2+(t.sample)^2
+
+newz2.basis = predict(z2.basis, z.sample)
+newt.basis = predict(t.basis, t.sample)
+newx.basis = cbind(newt.basis, newz2.basis)
+newX_ns = cbind(newx.basis, cproduct(newt.basis, newz2.basis))
+tau_hat = as.vector(cbind(1, newX_ns) %*% tau_beta)
+MSE = (tau0-tau_hat)^2 %>% sum()/nrow(df.sample)
+
+result.all[1] = MSE
+
+#keep = tibble(tau0, est = tau_hat, t = df.sample$observedtime)
+#ggplot(keep) + geom_point(aes(x = t, y = tau0), color = "red") +
+#  geom_point(aes(x = t, y = est), color = "blue")
+```
+
+## oracle
+
+replace truth in oracle
+
+```{r oracle}
+###################### oracle
+# put all subjects together
+df.pseudo = NULL
+for (i in 1:n) {
+  df.id = df %>% 
+    dplyr::filter(id == i) %>% 
+    tibble(k = 1:length(t.vector), t_k = t.vector, delta_t = delta_t.vector) %>% 
+    dplyr::filter(t_k <= observedtime) %>% 
+    mutate(counting = if_else(observedevent == 1 & t_k == observedtime, 1, 0))
+  if (nrow(df.id) == 0)
+    next
+  
+  df.pseudo = rbind(df.pseudo, df.id)
+}
+# add calculations
+df.pseudo3 = df.pseudo %>% 
+  group_by(id) %>%
+  arrange(k, .by_group = TRUE) %>%
+  mutate(
+    A_tk = (z2 + z2^2) * t_k + 1/2 * t_k^2 + 1/3 * t_k^3,
+    expTerm = exp(-A_tk),
+    
+    rho = expTerm / (1 + expTerm),
+    
+    Lambda_tk = b0 * t_k - log(0.5 + 0.5 * expTerm),
+    Lambda_delta = Lambda_tk - lag(Lambda_tk, default = 0)
+  ) %>%
+  ungroup()
+
+# pseudo y
+y.pseudo = (df.pseudo3$counting - df.pseudo3$Lambda_delta) / df.pseudo3$delta_t
+
+#### spline basis and ridge
+
+
+### using pseudo data for knots
+t.basis = splines::ns(df.pseudo3$t_k,df=10)
+z2.basis = splines::ns(df.pseudo3$z2,df=7)
+# combine two basis and add interaction
+x.basis = cbind(t.basis, z2.basis)
+X_ns = cbind(x.basis, cproduct(t.basis, z2.basis))
+colnames(X_ns) = paste("x", 1:ncol(X_ns), sep = "")
+x.pseudo = (df.pseudo3$trt - df.pseudo3$rho)*cbind(1, X_ns)
+penalty_factor_tau = c(0, rep(1, ncol(X_ns)))
+
+### Target estimation-ridge
+finalRidge = glmnet::cv.glmnet(x = x.pseudo, 
+                               y = y.pseudo,
+                               penalty.factor = penalty_factor_tau,
+                               intercept = FALSE,
+                               standardize = F,
+                               alpha  = 0,
+                               weights = df.pseudo3$delta_t,
+                               nfolds = 5,
+                               foldid = df.pseudo3$cvSplits
+)
+tau_beta = as.vector(coef(finalRidge, 
+                          s=finalRidge$lambda.min))[-1]
+
+# MSE
+
+newz2.basis = predict(z2.basis, z.sample)
+newt.basis = predict(t.basis, t.sample)
+newx.basis = cbind(newt.basis, newz2.basis)
+newX_ns = cbind(newx.basis, cproduct(newt.basis, newz2.basis))
+tau_hat = as.vector(cbind(1, newX_ns) %*% tau_beta)
+MSE = (tau0-tau_hat)^2 %>% sum()/nrow(df.sample)
+
+result.all[2] = MSE
+#output = c(result.all)
+#saveRDS(output, "result")
+
+#keep = keep %>% mutate(oracle = tau_hat)
+```
+
+## partial oracle
+
+```{r true rho}
+########################### true rho 
+# estimated nuisance model
+
+
+# put all subjects together
+df.pseudo = NULL
+for (i in 1:n) {
+  df.id = df %>% 
+    dplyr::filter(id == i) %>% 
+    tibble(k = 1:length(t.vector), t_k = t.vector, delta_t = delta_t.vector) %>% 
+    dplyr::filter(t_k <= observedtime) %>% 
+    mutate(counting = if_else(observedevent == 1 & t_k == observedtime, 1, 0))
+  if (nrow(df.id) == 0)
+    next
+  
+  survival.id = 1-phare(df.id$t_k, df.id[1,"z2"], hazard_m.list[[df.id$cfSplits[1]]])
+  
+  df.id = df.id %>% 
+    mutate(survival_tk = survival.id)
+  
+  df.pseudo = rbind(df.pseudo, df.id)
+}
+# add calculations
+df.pseudo2 = df.pseudo %>% 
+  mutate(t_k_pre = lag(t_k, default = 0),
+         expTerm = exp(-((z2+z2^2)*t_k+1/2*t_k^2+1/3*t_k^3))) %>%
+  mutate(rho = expTerm/(expTerm+1) ) %>% 
+  mutate(hazard_tk = -log(survival_tk))
+df.pseudo3 = df.pseudo2 %>% 
+  mutate(hazard_tkpre = lag(hazard_tk, default = 0)) %>% 
+  mutate(hazard_delta = as.vector(hazard_tk - hazard_tkpre))
+
+# pseudo y
+y.pseudo = (df.pseudo3$counting -
+              df.pseudo3$hazard_delta)/df.pseudo3$delta_t
+
+#### spline basis and ridge
+
+
+### using pseudo data for knots
+t.basis = splines::ns(df.pseudo3$t_k,df=15)
+z2.basis = splines::ns(df.pseudo3$z2,df=7)
+# combine two basis and add interaction
+x.basis = cbind(t.basis, z2.basis)
+X_ns = cbind(x.basis, cproduct(t.basis, z2.basis))
+colnames(X_ns) = paste("x", 1:ncol(X_ns), sep = "")
+x.pseudo = (df.pseudo3$trt - df.pseudo3$rho)*cbind(1, X_ns)
+penalty_factor_tau = c(0, rep(1, ncol(X_ns)))
+
+### Target estimation-ridge
+finalRidge = glmnet::cv.glmnet(x = x.pseudo, 
+                               y = y.pseudo,
+                               penalty.factor = penalty_factor_tau,
+                               intercept = FALSE,
+                               standardize = F,
+                               alpha  = 0,
+                               weights = df.pseudo3$delta_t,
+                               nfolds = 5,
+                               foldid = df.pseudo3$cvSplits
+)
+tau_beta = as.vector(coef(finalRidge, 
+                          s=finalRidge$lambda.min))[-1]
+
+# MSE
+
+newz2.basis = predict(z2.basis, z.sample)
+newt.basis = predict(t.basis, t.sample)
+newx.basis = cbind(newt.basis, newz2.basis)
+newX_ns = cbind(newx.basis, cproduct(newt.basis, newz2.basis))
+tau_hat = cbind(1, newX_ns) %*% tau_beta
+MSE = (tau0-tau_hat)^2 %>% sum()/nrow(df.sample)
+
+result.all[3] = MSE
+
+#keep = keep %>% 
+#  mutate(true_rho = tau_hat)
+```
+
+```{r true lambda m}
+########################### true lambda m 
+# estimated nuisance model
+
+
+# put all subjects together
+df.pseudo = NULL
+for (i in 1:n) {
+  df.id = df %>% 
+    dplyr::filter(id == i) %>% 
+    tibble(k = 1:length(t.vector), t_k = t.vector, delta_t = delta_t.vector) %>% 
+    dplyr::filter(t_k <= observedtime) %>% 
+    mutate(counting = if_else(observedevent == 1 & t_k == observedtime, 1, 0))
+  if (nrow(df.id) == 0)
+    next
+  
+  survival0.id = 1-phare(df.id$t_k, c(df.id[1,"z2"], m.trt0), surv_c.list[[df.id$cfSplits[1]]])
+  survival1.id = 1-phare(df.id$t_k, c(df.id[1,"z2"], m.trt1), surv_c.list[[df.id$cfSplits[1]]])
+  pi.id = predict.glm(pi_hat.list[[df.id$cfSplits[1]]], newdata = tibble(z2 = df.id$z2[1]), type = "response")
+  
+  df.id = df.id %>% 
+    mutate(
+           survival0 = survival0.id,
+           survival1 = survival1.id,
+           pi = pi.id)
+  
+  df.pseudo = rbind(df.pseudo, df.id)
+}
+# add calculations
+df.pseudo2 = df.pseudo %>% 
+  mutate(t_k_pre = lag(t_k, default = 0)) %>%
+  mutate(rho = pi*survival1/survival0 / (1 + (survival1/survival0-1)*pi) )
+df.pseudo3 = df.pseudo2 %>% 
+  mutate(expTerm = exp(-((z2+z2^2)*t_k+1/2*t_k^2+1/3*t_k^3)),
+         hazardrate_tk = b0+(z2+z2^2+t_k+t_k^2)*expTerm/(expTerm+1)
+  ) %>% 
+  mutate(
+    hazard_delta = hazardrate_tk*delta_t)
+
+# pseudo y
+y.pseudo = (df.pseudo3$counting -
+              df.pseudo3$hazard_delta)/df.pseudo3$delta_t
+
+#### spline basis and ridge
+
+
+### using pseudo data for knots
+t.basis = splines::ns(df.pseudo3$t_k,df=15)
+z2.basis = splines::ns(df.pseudo3$z2,df=7)
+# combine two basis and add interaction
+x.basis = cbind(t.basis, z2.basis)
+X_ns = cbind(x.basis, cproduct(t.basis, z2.basis))
+colnames(X_ns) = paste("x", 1:ncol(X_ns), sep = "")
+x.pseudo = (df.pseudo3$trt - df.pseudo3$rho)*cbind(1, X_ns)
+penalty_factor_tau = c(0, rep(1, ncol(X_ns)))
+
+### Target estimation-ridge
+finalRidge = glmnet::cv.glmnet(x = x.pseudo, 
+                               y = y.pseudo,
+                               penalty.factor = penalty_factor_tau,
+                               intercept = FALSE,
+                               standardize = F,
+                               alpha  = 0,
+                               weights = df.pseudo3$delta_t,
+                               nfolds = 5,
+                               foldid = df.pseudo3$cvSplits
+)
+tau_beta = as.vector(coef(finalRidge, 
+                          s=finalRidge$lambda.min))[-1]
+
+# MSE
+
+newz2.basis = predict(z2.basis, z.sample)
+newt.basis = predict(t.basis, t.sample)
+newx.basis = cbind(newt.basis, newz2.basis)
+newX_ns = cbind(newx.basis, cproduct(newt.basis, newz2.basis))
+tau_hat = cbind(1, newX_ns) %*% tau_beta
+MSE = (tau0-tau_hat)^2 %>% sum()/nrow(df.sample)
+
+result.all[4] = MSE
+
+#keep = keep %>% 
+#  mutate(true_lambdam = tau_hat)
+
+output = rbind(output, result.all)
+#saveRDS(output, "result")
+```
+
+
+
+
+# Check marginal hazard model (not changed yet)
+
+```{r data}
+t85 = 1.4
+result.all = rep(0,4)
+
+names(result.all) = c("estimated mse", "oracle mse", 
+                      "true rho", "true lambda m")
+#names(ise.all) = c("estimated ise", "oracle ise")
+
+b0 = 1
+n = 300
+m.trt0 = tibble(trt = 0)
+m.trt1 = tibble(trt = 1)
+# f for uniroot
+f.uniroot = function(t, a, b, c, d) {
+  b*t + a/c*atan(t/c) + d
+}
+df = data.frame(id = 1:n,  
+                z1 = runif(n, -2, 2),
+                z2 = runif(n, -2, 2),
+                z3 = runif(n, -2, 2),
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 6)) %>%
+  mutate(trt.pi = if_else(z1>0, 0.9, 0.1)) %>% 
+  rowwise() %>%
+  mutate(trt = rbinom(1, 1, trt.pi),
+    a = trt,
+         b = b0,
+         c = sqrt(0.1+z1^2+(z2+z3)^2),
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+# CV folds
+K = 5 # K folds for cv
+cvSplits = createFolds(df$observedevent, k = K, list = F)
+# Add fold id
+df = df %>% cbind(cvSplits)
+# t_k vector
+t.vector = df %>% 
+  dplyr::filter(observedevent == 1) %>% 
+  pull(observedtime)
+delta_t.vector = t.vector - lag(t.vector, default = 0)
+```
+
+```{r check marginal hazard model from p data}
+# estimated model
+df.m = df %>% as.matrix()
+hazard_m.model = hare(df.m[,"observedtime"], 
+                      df.m[,"observedevent"], df.m[, c("z1","z2","z3")])
+# pseudo data
+df.pseudo = NULL
+for (i in 1:n) {
+  df.id = df %>% 
+    dplyr::filter(id == i) %>% 
+    tibble(k = 1:length(t.vector), t_k = t.vector, delta_t = delta_t.vector) %>% 
+    dplyr::filter(t_k <= observedtime) %>% 
+    mutate(counting = if_else(observedevent == 1 & t_k == observedtime, 1, 0))
+  if (nrow(df.id) == 0)
+    next
+  
+  survival.id = 1-phare(df.id$t_k, df.id[1,c("z1","z2","z3")], hazard_m.model)
+  df.id = df.id %>% 
+    mutate(survival_tk = survival.id)
+  
+  df.pseudo = rbind(df.pseudo, df.id)
+}
+
+# add true model to p. data
+df.pseudo2 = df.pseudo %>% 
+  mutate(t_k_pre = lag(t_k, default = 0),
+         expTerm = exp(
+           -1/sqrt(0.1+z1^2+(z2+z3)^2)*
+             atan(t_k/sqrt(0.1+z1^2+(z2+z3)^2))
+         )
+         ) %>%
+  mutate(rho = trt.pi*expTerm/(1+(expTerm-1)*trt.pi)) %>% 
+  mutate(hazardrate_tk = b0+1/(0.1+z1^2+(z2+z3)^2+t_k^2)*rho) %>% 
+  mutate(hazard_delta_true = hazardrate_tk*delta_t)
+# calculate estimated hazard delta
+df.pseudo3 = df.pseudo2 %>% 
+  mutate(hazard_tk = -log(survival_tk)) %>% 
+  mutate(hazard_tkpre = lag(hazard_tk, default = 0)) %>% 
+  mutate(hazard_delta_est = as.vector(hazard_tk - hazard_tkpre))
+
+diff = df.pseudo3 %>% 
+  dplyr::select(hazard_delta_true, hazard_delta_est) %>% 
+  mutate(diff = -hazard_delta_true+hazard_delta_est)
+
+bias = mean(diff$diff)
+abs_bias = mean(abs(diff$diff))
+mse = mean(diff$diff^2)
+var = var(diff$diff)
+
+output = c(mse, bias, abs_bias, var)
+#saveRDS(output, "result")
+```
+
+```{r check marginal hazard model from original data}
+# estimated model
+df.m = df %>% as.matrix()
+hazard_m.model = hare(df.m[,"observedtime"], 
+                      df.m[,"observedevent"], df.m[, c("z1","z2","z3")])
+check = NULL
+for (i in 1:n) {
+  df.id = df %>% 
+    dplyr::filter(id == i) %>% 
+    mutate(hazardrate_est = hhare(observedtime, c(z1, z2, z3), hazard_m.model))
+  check = rbind(check, df.id)
+  
+}
+check = check %>% 
+  mutate(
+         expTerm = exp(
+           -1/sqrt(0.1+z1^2+(z2+z3)^2)*
+             atan(observedtime/sqrt(0.1+z1^2+(z2+z3)^2))),
+         hazardrate_true = b0+1/(0.1+z1^2+(z2+z3)^2+observedtime^2)*(trt.pi*expTerm/(1+(expTerm-1)*trt.pi))
+         )
+
+
+diff = check %>% 
+  dplyr::select(hazardrate_true, hazardrate_est) %>% 
+  mutate(diff = -hazardrate_true+hazardrate_est)
+
+bias = mean(diff$diff)
+abs_bias = mean(abs(diff$diff))
+mse = mean(diff$diff^2)
+var = var(diff$diff)
+
+output = c(mse, bias, abs_bias, var)
+#saveRDS(output, "result")
+```
+
+## 100 simulations
+
+### n=500
+
+```{r}
+output = NULL
+for (rep in 1:100) {
+  b0 = 1
+n = 500
+m.trt0 = tibble(trt = 0)
+m.trt1 = tibble(trt = 1)
+# f for uniroot
+f.uniroot = function(t, a, b, c, d) {
+  b*t + a/c*atan(t/c) + d
+}
+df = data.frame(id = 1:n,  
+                z1 = runif(n, -2, 2),
+                z2 = runif(n, -2, 2),
+                z3 = runif(n, -2, 2),
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 6)) %>%
+  mutate(trt.pi = if_else(z1>0, 0.9, 0.1)) %>% 
+  rowwise() %>%
+  mutate(trt = rbinom(1, 1, trt.pi),
+    a = trt,
+         b = b0,
+         c = sqrt(0.1+z1^2+(z2+z3)^2),
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+# CV folds
+K = 5 # K folds for cv
+cvSplits = createFolds(df$observedevent, k = K, list = F)
+# Add fold id
+df = df %>% cbind(cvSplits)
+# t_k vector
+t.vector = df %>% 
+  dplyr::filter(observedevent == 1) %>% 
+  pull(observedtime)
+delta_t.vector = t.vector - lag(t.vector, default = 0)
+
+# estimated model
+df.m = df %>% as.matrix()
+hazard_m.model = hare(df.m[,"observedtime"], 
+                      df.m[,"observedevent"], df.m[, c("z1","z2","z3")])
+check = NULL
+for (i in 1:n) {
+  df.id = df %>% 
+    dplyr::filter(id == i) %>% 
+    mutate(hazardrate_est = hhare(observedtime, c(z1, z2, z3), hazard_m.model))
+  check = rbind(check, df.id)
+  
+}
+check = check %>% 
+  mutate(
+         expTerm = exp(
+           -1/sqrt(0.1+z1^2+(z2+z3)^2)*
+             atan(observedtime/sqrt(0.1+z1^2+(z2+z3)^2))),
+         hazardrate_true = b0+1/(0.1+z1^2+(z2+z3)^2+observedtime^2)*(trt.pi*expTerm/(1+(expTerm-1)*trt.pi))
+         )
+
+
+diff = check %>% 
+  dplyr::select(hazardrate_true, hazardrate_est) %>% 
+  mutate(diff = -hazardrate_true+hazardrate_est)
+
+bias = mean(diff$diff)
+abs_bias = mean(abs(diff$diff))
+mse = mean(diff$diff^2)
+var = var(diff$diff)
+
+output = rbind(output, c(mse, bias, abs_bias, var))
+}
+saveRDS(output, "output hazardm 500")
+```
+
+
+
+
+
+
+### n=750
+
+```{r}
+output2 = NULL
+for (rep in 1:100) {
+  b0 = 1
+n = 750
+m.trt0 = tibble(trt = 0)
+m.trt1 = tibble(trt = 1)
+# f for uniroot
+f.uniroot = function(t, a, b, c, d) {
+  b*t + a/c*atan(t/c) + d
+}
+df = data.frame(id = 1:n,  
+                z1 = runif(n, -2, 2),
+                z2 = runif(n, -2, 2),
+                z3 = runif(n, -2, 2),
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 6)) %>%
+  mutate(trt.pi = if_else(z1>0, 0.9, 0.1)) %>% 
+  rowwise() %>%
+  mutate(trt = rbinom(1, 1, trt.pi),
+    a = trt,
+         b = b0,
+         c = sqrt(0.1+z1^2+(z2+z3)^2),
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+# CV folds
+K = 5 # K folds for cv
+cvSplits = createFolds(df$observedevent, k = K, list = F)
+# Add fold id
+df = df %>% cbind(cvSplits)
+# t_k vector
+t.vector = df %>% 
+  dplyr::filter(observedevent == 1) %>% 
+  pull(observedtime)
+delta_t.vector = t.vector - lag(t.vector, default = 0)
+
+# estimated model
+df.m = df %>% as.matrix()
+hazard_m.model = hare(df.m[,"observedtime"], 
+                      df.m[,"observedevent"], df.m[, c("z1","z2","z3")])
+check = NULL
+for (i in 1:n) {
+  df.id = df %>% 
+    dplyr::filter(id == i) %>% 
+    mutate(hazardrate_est = hhare(observedtime, c(z1, z2, z3), hazard_m.model))
+  check = rbind(check, df.id)
+  
+}
+check = check %>% 
+  mutate(
+         expTerm = exp(
+           -1/sqrt(0.1+z1^2+(z2+z3)^2)*
+             atan(observedtime/sqrt(0.1+z1^2+(z2+z3)^2))),
+         hazardrate_true = b0+1/(0.1+z1^2+(z2+z3)^2+observedtime^2)*(trt.pi*expTerm/(1+(expTerm-1)*trt.pi))
+         )
+
+
+diff = check %>% 
+  dplyr::select(hazardrate_true, hazardrate_est) %>% 
+  mutate(diff = -hazardrate_true+hazardrate_est)
+
+bias = mean(diff$diff)
+abs_bias = mean(abs(diff$diff))
+mse = mean(diff$diff^2)
+var = var(diff$diff)
+
+output2 = rbind(output2, c(mse, bias, abs_bias, var))
+}
+saveRDS(output2, "output hazardm 750")
+```
+
+
+
+
+### n=1000
+
+```{r}
+output3 = NULL
+for (rep in 1:100) {
+  b0 = 1
+n = 1000
+m.trt0 = tibble(trt = 0)
+m.trt1 = tibble(trt = 1)
+# f for uniroot
+f.uniroot = function(t, a, b, c, d) {
+  b*t + a/c*atan(t/c) + d
+}
+df = data.frame(id = 1:n,  
+                z1 = runif(n, -2, 2),
+                z2 = runif(n, -2, 2),
+                z3 = runif(n, -2, 2),
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 6)) %>%
+  mutate(trt.pi = if_else(z1>0, 0.9, 0.1)) %>% 
+  rowwise() %>%
+  mutate(trt = rbinom(1, 1, trt.pi),
+    a = trt,
+         b = b0,
+         c = sqrt(0.1+z1^2+(z2+z3)^2),
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+# CV folds
+K = 5 # K folds for cv
+cvSplits = createFolds(df$observedevent, k = K, list = F)
+# Add fold id
+df = df %>% cbind(cvSplits)
+# t_k vector
+t.vector = df %>% 
+  dplyr::filter(observedevent == 1) %>% 
+  pull(observedtime)
+delta_t.vector = t.vector - lag(t.vector, default = 0)
+
+# estimated model
+df.m = df %>% as.matrix()
+hazard_m.model = hare(df.m[,"observedtime"], 
+                      df.m[,"observedevent"], df.m[, c("z1","z2","z3")])
+check = df %>% 
+  rowwise() %>% 
+  mutate(hazardrate_est = hhare(observedtime, c(z1, z2, z3), hazard_m.model))
+check = check %>% 
+  mutate(
+         expTerm = exp(
+           -1/sqrt(0.1+z1^2+(z2+z3)^2)*
+             atan(observedtime/sqrt(0.1+z1^2+(z2+z3)^2))),
+         hazardrate_true = b0+1/(0.1+z1^2+(z2+z3)^2+observedtime^2)*(trt.pi*expTerm/(1+(expTerm-1)*trt.pi))
+         )
+
+
+diff = check %>% 
+  dplyr::select(hazardrate_true, hazardrate_est) %>% 
+  mutate(diff = -hazardrate_true+hazardrate_est)
+
+bias = mean(diff$diff)
+abs_bias = mean(abs(diff$diff))
+mse = mean(diff$diff^2)
+var = var(diff$diff)
+
+output3 = rbind(output3, c(mse, bias, abs_bias, var))
+}
+saveRDS(output3, "output hazardm 1000")
+```
+
+```{r}
+d1=readRDS("output hazardm 500") %>% 
+  as_tibble() %>% 
+  mutate(size=500)
+d2=readRDS("output hazardm 750") %>% 
+    as_tibble() %>% 
+  mutate(size=750)
+d3=readRDS("output hazardm 1000") %>% 
+    as_tibble() %>% 
+  mutate(size=1000)
+d = rbind(d1, d2, d3)
+colnames(d)[1:4] = c("mse", "bias", "abs_bias", "var")
+d %>% group_by(size) %>%  summarise(across(mse:var, ~ mean(.x, na.rm = TRUE))) %>% 
+  knitr::kable(digits=3)
+
+d %>% group_by(size) %>%  summarise(across(mse:var, ~ median(.x, na.rm = TRUE))) %>% 
+  knitr::kable(digits=3)
+```
+
+
+# Check pi
+
+## 100 simulations
+
+### n=500
+
+```{r}
+output = NULL
+for (rep in 1:100) {
+  b0 = 1
+n = 500
+m.trt0 = tibble(trt = 0)
+m.trt1 = tibble(trt = 1)
+# f for uniroot
+f.uniroot = function(t, a, b, c, d) {
+  b*t + a/c*atan(t/c) + d
+}
+df = data.frame(id = 1:n,  
+                z1 = runif(n, -2, 2),
+                z2 = runif(n, -2, 2),
+                z3 = runif(n, -2, 2),
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 6)) %>%
+  mutate(trt.pi = if_else(z1>0, 0.9, 0.1)) %>% 
+  rowwise() %>%
+  mutate(trt = rbinom(1, 1, trt.pi),
+    a = trt,
+         b = b0,
+         c = sqrt(0.1+z1^2+(z2+z3)^2),
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+# CV folds
+K = 5 # K folds for cv
+cvSplits = createFolds(df$observedevent, k = K, list = F)
+# Add fold id
+df = df %>% cbind(cvSplits)
+# t_k vector
+t.vector = df %>% 
+  dplyr::filter(observedevent == 1) %>% 
+  pull(observedtime)
+delta_t.vector = t.vector - lag(t.vector, default = 0)
+
+# estimated model
+pi_hat.model = gam(trt ~ s(z1,3), data = df, family = "binomial")
+check = df  %>% 
+  rowwise() %>% 
+    mutate(pi_pred = predict.glm(pi_hat.model, newdata = tibble(z1 = z1), type = "response"))
+
+
+diff = check %>% 
+  dplyr::select(trt.pi, pi_pred) %>% 
+  mutate(diff = trt.pi-pi_pred)
+
+bias = mean(diff$diff)
+abs_bias = mean(abs(diff$diff))
+mse = mean(diff$diff^2)
+var = var(diff$diff)
+
+output = rbind(output, c(mse, bias, abs_bias, var))
+}
+saveRDS(output, "output pi 500")
+
+summary(output)
+```
+
+```{r}
+output = NULL
+for (rep in 1:100) {
+  b0 = 1
+n = 750
+m.trt0 = tibble(trt = 0)
+m.trt1 = tibble(trt = 1)
+# f for uniroot
+f.uniroot = function(t, a, b, c, d) {
+  b*t + a/c*atan(t/c) + d
+}
+df = data.frame(id = 1:n,  
+                z1 = runif(n, -2, 2),
+                z2 = runif(n, -2, 2),
+                z3 = runif(n, -2, 2),
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 6)) %>%
+  mutate(trt.pi = if_else(z1>0, 0.9, 0.1)) %>% 
+  rowwise() %>%
+  mutate(trt = rbinom(1, 1, trt.pi),
+    a = trt,
+         b = b0,
+         c = sqrt(0.1+z1^2+(z2+z3)^2),
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+# CV folds
+K = 5 # K folds for cv
+cvSplits = createFolds(df$observedevent, k = K, list = F)
+# Add fold id
+df = df %>% cbind(cvSplits)
+# t_k vector
+t.vector = df %>% 
+  dplyr::filter(observedevent == 1) %>% 
+  pull(observedtime)
+delta_t.vector = t.vector - lag(t.vector, default = 0)
+
+# estimated model
+pi_hat.model = gam(trt ~ s(z1,3), data = df, family = "binomial")
+check = df  %>% 
+  rowwise() %>% 
+    mutate(pi_pred = predict.glm(pi_hat.model, newdata = tibble(z1 = z1), type = "response"))
+
+
+diff = check %>% 
+  dplyr::select(trt.pi, pi_pred) %>% 
+  mutate(diff = trt.pi-pi_pred)
+
+bias = mean(diff$diff)
+abs_bias = mean(abs(diff$diff))
+mse = mean(diff$diff^2)
+var = var(diff$diff)
+
+output = rbind(output, c(mse, bias, abs_bias, var))
+}
+saveRDS(output, "output pi 750")
+
+summary(output)
+
+
+output = NULL
+for (rep in 1:100) {
+  b0 = 1
+n = 1000
+m.trt0 = tibble(trt = 0)
+m.trt1 = tibble(trt = 1)
+# f for uniroot
+f.uniroot = function(t, a, b, c, d) {
+  b*t + a/c*atan(t/c) + d
+}
+df = data.frame(id = 1:n,  
+                z1 = runif(n, -2, 2),
+                z2 = runif(n, -2, 2),
+                z3 = runif(n, -2, 2),
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 6)) %>%
+  mutate(trt.pi = if_else(z1>0, 0.9, 0.1)) %>% 
+  rowwise() %>%
+  mutate(trt = rbinom(1, 1, trt.pi),
+    a = trt,
+         b = b0,
+         c = sqrt(0.1+z1^2+(z2+z3)^2),
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+# CV folds
+K = 5 # K folds for cv
+cvSplits = createFolds(df$observedevent, k = K, list = F)
+# Add fold id
+df = df %>% cbind(cvSplits)
+# t_k vector
+t.vector = df %>% 
+  dplyr::filter(observedevent == 1) %>% 
+  pull(observedtime)
+delta_t.vector = t.vector - lag(t.vector, default = 0)
+
+# estimated model
+pi_hat.model = gam(trt ~ s(z1,3), data = df, family = "binomial")
+check = df  %>% 
+  rowwise() %>% 
+    mutate(pi_pred = predict.glm(pi_hat.model, newdata = tibble(z1 = z1), type = "response"))
+
+
+diff = check %>% 
+  dplyr::select(trt.pi, pi_pred) %>% 
+  mutate(diff = trt.pi-pi_pred)
+
+bias = mean(diff$diff)
+abs_bias = mean(abs(diff$diff))
+mse = mean(diff$diff^2)
+var = var(diff$diff)
+
+output = rbind(output, c(mse, bias, abs_bias, var))
+}
+saveRDS(output, "output pi 1000")
+summary(output)
+```
+
+# Check conditional survival
+
+```{r}
+output = NULL
+for (rep in 1:100) {
+  b0 = 1
+n = 500
+m.trt0 = tibble(trt = 0)
+m.trt1 = tibble(trt = 1)
+# f for uniroot
+f.uniroot = function(t, a, b, c, d) {
+  b*t + a/c*atan(t/c) + d
+}
+df = data.frame(id = 1:n,  
+                z1 = runif(n, -2, 2),
+                z2 = runif(n, -2, 2),
+                z3 = runif(n, -2, 2),
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 6)) %>%
+  mutate(trt.pi = if_else(z1>0, 0.9, 0.1)) %>% 
+  rowwise() %>%
+  mutate(trt = rbinom(1, 1, trt.pi),
+    a = trt,
+         b = b0,
+         c = sqrt(0.1+z1^2+(z2+z3)^2),
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+# CV folds
+K = 5 # K folds for cv
+cvSplits = createFolds(df$observedevent, k = K, list = F)
+# Add fold id
+df = df %>% cbind(cvSplits)
+# t_k vector
+t.vector = df %>% 
+  dplyr::filter(observedevent == 1) %>% 
+  pull(observedtime)
+delta_t.vector = t.vector - lag(t.vector, default = 0)
+
+# estimated model
+df.m = df %>% as.matrix()
+surv_c.model = hare(df.m[,"observedtime"], df.m[,"observedevent"], df.m[, c("z1","z2","z3", "trt")])
+
+check = df %>% 
+  rowwise() %>% 
+  mutate(chazardrate_est = hhare(observedtime, c(z1, z2, z3, trt), surv_c.model))
+
+check = check %>% 
+  mutate(
+         chazardrate_true = b0+trt/(0.1+z1^2+(z2+z3)^2+observedtime^2)
+         )
+
+
+diff = check %>% 
+  dplyr::select(chazardrate_true, chazardrate_est) %>% 
+  mutate(diff = -chazardrate_true+chazardrate_est)
+
+bias = mean(diff$diff)
+abs_bias = mean(abs(diff$diff))
+mse = mean(diff$diff^2)
+var = var(diff$diff)
+
+output = rbind(output, c(mse, bias, abs_bias, var))
+}
+saveRDS(output, "output csurvival 500")
+summary(output)
+
+output = NULL
+for (rep in 1:100) {
+  b0 = 1
+n = 750
+m.trt0 = tibble(trt = 0)
+m.trt1 = tibble(trt = 1)
+# f for uniroot
+f.uniroot = function(t, a, b, c, d) {
+  b*t + a/c*atan(t/c) + d
+}
+df = data.frame(id = 1:n,  
+                z1 = runif(n, -2, 2),
+                z2 = runif(n, -2, 2),
+                z3 = runif(n, -2, 2),
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 6)) %>%
+  mutate(trt.pi = if_else(z1>0, 0.9, 0.1)) %>% 
+  rowwise() %>%
+  mutate(trt = rbinom(1, 1, trt.pi),
+    a = trt,
+         b = b0,
+         c = sqrt(0.1+z1^2+(z2+z3)^2),
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+# CV folds
+K = 5 # K folds for cv
+cvSplits = createFolds(df$observedevent, k = K, list = F)
+# Add fold id
+df = df %>% cbind(cvSplits)
+# t_k vector
+t.vector = df %>% 
+  dplyr::filter(observedevent == 1) %>% 
+  pull(observedtime)
+delta_t.vector = t.vector - lag(t.vector, default = 0)
+
+# estimated model
+df.m = df %>% as.matrix()
+surv_c.model = hare(df.m[,"observedtime"], df.m[,"observedevent"], df.m[, c("z1","z2","z3", "trt")])
+
+check = df %>% 
+  rowwise() %>% 
+  mutate(chazardrate_est = hhare(observedtime, c(z1, z2, z3, trt), surv_c.model))
+
+check = check %>% 
+  mutate(
+         chazardrate_true = b0+trt/(0.1+z1^2+(z2+z3)^2+observedtime^2)
+         )
+
+
+diff = check %>% 
+  dplyr::select(chazardrate_true, chazardrate_est) %>% 
+  mutate(diff = -chazardrate_true+chazardrate_est)
+
+bias = mean(diff$diff)
+abs_bias = mean(abs(diff$diff))
+mse = mean(diff$diff^2)
+var = var(diff$diff)
+
+output = rbind(output, c(mse, bias, abs_bias, var))
+}
+saveRDS(output, "output csurvival 750")
+summary(output)
+
+output = NULL
+for (rep in 1:100) {
+  b0 = 1
+n = 1000
+m.trt0 = tibble(trt = 0)
+m.trt1 = tibble(trt = 1)
+# f for uniroot
+f.uniroot = function(t, a, b, c, d) {
+  b*t + a/c*atan(t/c) + d
+}
+df = data.frame(id = 1:n,  
+                z1 = runif(n, -2, 2),
+                z2 = runif(n, -2, 2),
+                z3 = runif(n, -2, 2),
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 6)) %>%
+  mutate(trt.pi = if_else(z1>0, 0.9, 0.1)) %>% 
+  rowwise() %>%
+  mutate(trt = rbinom(1, 1, trt.pi),
+    a = trt,
+         b = b0,
+         c = sqrt(0.1+z1^2+(z2+z3)^2),
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+# CV folds
+K = 5 # K folds for cv
+cvSplits = createFolds(df$observedevent, k = K, list = F)
+# Add fold id
+df = df %>% cbind(cvSplits)
+# t_k vector
+t.vector = df %>% 
+  dplyr::filter(observedevent == 1) %>% 
+  pull(observedtime)
+delta_t.vector = t.vector - lag(t.vector, default = 0)
+
+# estimated model
+df.m = df %>% as.matrix()
+surv_c.model = hare(df.m[,"observedtime"], df.m[,"observedevent"], df.m[, c("z1","z2","z3", "trt")])
+
+check = df %>% 
+  rowwise() %>% 
+  mutate(chazardrate_est = hhare(observedtime, c(z1, z2, z3, trt), surv_c.model))
+
+check = check %>% 
+  mutate(
+         chazardrate_true = b0+trt/(0.1+z1^2+(z2+z3)^2+observedtime^2)
+         )
+
+
+diff = check %>% 
+  dplyr::select(chazardrate_true, chazardrate_est) %>% 
+  mutate(diff = -chazardrate_true+chazardrate_est)
+
+bias = mean(diff$diff)
+abs_bias = mean(abs(diff$diff))
+mse = mean(diff$diff^2)
+var = var(diff$diff)
+
+output = rbind(output, c(mse, bias, abs_bias, var))
+}
+saveRDS(output, "output csurvival 1000")
+summary(output)
+```
+
+

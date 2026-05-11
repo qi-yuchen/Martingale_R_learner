@@ -1,0 +1,161 @@
+---
+title: "Simulation"
+author: "Yuchen Qi"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# For all code files
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(survival)
+library(gam)
+library(polspline)
+library(caret)
+
+cproduct = function(m1, m2) {
+  m1_ncol = ncol(m1)
+  m1_colname = colnames(m1)
+  m2_ncol = ncol(m2)
+  m2_colname = colnames(m2)
+  cpro = NULL
+  for (i in 1:m1_ncol) {
+    matrix = m1[, i]*m2
+    colnames(matrix) = paste(m1_colname[i], "*", m2_colname, sep = "")
+    cpro = cbind(cpro, matrix)
+  }
+  cpro
+}
+```
+
+# Setup A
+
+Reuse: replace t85, b0, f.uniroot, and df
+
+```{r data}
+#set.seed(1)
+t85 = 1.892546
+result.all = rep(0,2)
+names(result.all) = c("slearner mse", "tlearner mse")
+
+b0 = 1/2
+n = 500
+m.trt0 = tibble(trt = 0)
+m.trt1 = tibble(trt = 1)
+# f for uniroot
+f.uniroot = function(t, a, b, c, d) {
+  a*t^3 + b*t^2 + c*t + d
+}
+
+df = data.frame(id = 1:n,  
+                z2 = runif(n, -2, 2),
+                trt = rbinom(n, 1, 0.5), 
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 8.5)) %>% 
+  rowwise() %>%
+  mutate(a = 1/3,
+         b = 1/2,
+         c = b0 + z2 + z2^2,
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+df = cbind(df)
+```
+
+# Test data
+
+Reuse: change test.data
+
+```{r}
+set.seed(1234)
+
+test.data = data.frame(id = 1:n,  
+                z2 = runif(n, -2, 2),
+                trt = rbinom(n, 1, 0.5), 
+                u = runif(n, 0 ,1),
+                censortime = runif(n, 0, 8.5)) %>% 
+  rowwise() %>%
+  mutate(a = 1/3,
+         b = 1/2,
+         c = b0 + z2 + z2^2,
+         d = log(u),
+         eventtime = 
+           if_else(trt == 0, -log(u)/b0,
+                   uniroot(f.uniroot, c(0, 100), 
+                           a=a, b=b, c=c, d=d, tol=1e-10)$root)) %>%
+  mutate(observedtime = min(eventtime, censortime),
+         observedevent = as.integer(eventtime<=censortime)
+  ) %>% 
+  ungroup() %>% 
+  arrange(observedtime)
+
+set.seed(NULL)
+```
+
+# S-learner
+
+Reuse: change covariates, change df.sample and tau0
+
+```{r}
+## covariates
+covariates = c("z2")
+## Learn from df, using hare
+slearner = hare(df[,"observedtime"], df[,"observedevent"],
+                 df[, c(covariates, "trt")])
+## MSE
+df.sample = test.data %>% 
+  dplyr::filter(observedtime<=t85)
+z.sample = df.sample$z2
+t.sample = df.sample$observedtime
+tau0 = z.sample+t.sample+
+  (z.sample)^2+(t.sample)^2
+
+slearner.hazard0 = hhare(
+  q = df.sample$observedtime,
+  cov = cbind(df.sample[, covariates], trt=0),
+  fit = slearner
+)
+slearner.hazard1 = hhare(
+  q = df.sample$observedtime,
+  cov = cbind(df.sample[, covariates], trt=1),
+  fit = slearner
+)
+tau_hat = slearner.hazard1-slearner.hazard0
+MSE = (tau0-tau_hat)^2 %>% sum()/nrow(df.sample)
+```
+
+# T-learner
+
+```{r}
+## Learn from df, using hare
+tlearner1 = hare(df[df$trt == 1,"observedtime"], df[df$trt == 1,"observedevent"],
+                 df[df$trt == 1, covariates])
+tlearner0 = hare(df[df$trt == 0,"observedtime"], df[df$trt == 0,"observedevent"],
+                 df[df$trt == 0, covariates])
+## MSE
+tlearner.hazard0 = hhare(
+  q = df.sample$observedtime,
+  cov = cbind(df.sample[, covariates]),
+  fit = tlearner0
+)
+tlearner.hazard1 = hhare(
+  q = df.sample$observedtime,
+  cov = cbind(df.sample[, covariates]),
+  fit = tlearner1
+)
+tau_hat = tlearner.hazard1-tlearner.hazard0
+MSE = (tau0-tau_hat)^2 %>% sum()/nrow(df.sample)
+```
+

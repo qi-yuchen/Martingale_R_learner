@@ -14,7 +14,7 @@ The code includes:
 For each simulation replicate, the code:
 
 1. generates one training dataset under a specified data-generating mechanism
-2. generates or reuses a fixed independent test dataset
+2. generates a fixed independent test dataset
 3. fits the Martingale R-learner and benchmark learners
 4. evaluates performance by mean squared error on the test dataset
 
@@ -22,8 +22,8 @@ The Martingale R-learner implementation uses:
 
 - cross-fitted nuisance estimation
 - pseudo-data construction over ordered event times
-- spline basis expansion for the target treatment effect function
-- weighted ridge regression for target estimation
+- spline basis expansion for the target parameter
+- ridge penalty for target estimation
 
 ## Requirements
 
@@ -56,7 +56,7 @@ install.packages(c(
 A copy of a simulated dataset from simulation Setup A is provided in
 `example/simulated_data.rds`.
 
-The dataset contains the subject ID, effect modifier `z2`, treatment
+The dataset contains the subject ID, covariate, treatment
 indicator, observed follow-up time, and event indicator.
 
 ### 1. Load the simulated data
@@ -95,13 +95,12 @@ mrl_fit$lambda
 
 The nuisance estimation includes a treatment propensity model and a
 conditional survival model. The marginal survival function is obtained
-by averaging the treatment-specific conditional survival functions using
+by averaging the conditional survival functions using
 the estimated propensity score.
 
 ### 3. Predict the estimated HTE
 
-For example, consider three combinations of follow-up time and the effect
-modifier `z2`:
+For example, consider three combinations of follow-up time and the covariate `z2`:
 
 ```r
 new_data <- data.frame(

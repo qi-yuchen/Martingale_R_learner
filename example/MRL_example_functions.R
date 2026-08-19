@@ -1,7 +1,5 @@
-# Helper functions for the simple Martingale R-learner example.
-# This is the estimated-nuisance portion of setup_A_revised.R wrapped
-# into reusable fit/predict functions. It omits the oracle calculation
-# and simulation MSE evaluation used only for the full simulation study.
+# Functions for the simple Martingale R-learner example
+# This is based on setup_A_revised.R
 
 cproduct <- function(m1, m2) {
   m1 <- as.matrix(m1)
@@ -37,7 +35,7 @@ fit_mrl <- function(
 
   df <- data[, required_columns]
 
-  # CV folds for selecting the spline degree of freedom and ridge penalty.
+  # CV folds for selecting the spline degree of freedom and ridge penalty
   set.seed(fold_seed)
   df$cvSplits <- caret::createFolds(
     df$observedevent,
@@ -45,27 +43,21 @@ fit_mrl <- function(
     list = FALSE
   )
 
-  # Cross-fitting folds for nuisance estimation.
+  # Cross-fitting folds for nuisance estimation
   df$cfSplits <- caret::createFolds(
     df$observedevent,
     k = Q,
     list = FALSE
   )
 
-  # Event-time grid.
   t.vector <- sort(unique(
     df$observedtime[df$observedevent == 1]
   ))
 
   delta_t.vector <- t.vector - c(0, head(t.vector, -1))
 
-  # Keep the original gam::gam smooth-term syntax while avoiding
-  # a global library(gam) call.
   s <- gam::s
 
-  # Cross-fitted nuisance models:
-  # 1) treatment propensity pi(Z)
-  # 2) conditional survival S(t | Z, D)
   pi_hat.list <- vector("list", Q)
   surv_c.list <- vector("list", Q)
 
@@ -85,7 +77,6 @@ fit_mrl <- function(
     )
   }
 
-  # Split subjects by CV fold and then into computational batches.
   rows_by_cv <- split(
     seq_len(nrow(df)),
     factor(df$cvSplits, levels = seq_len(K))
@@ -111,7 +102,6 @@ fit_mrl <- function(
 
     cat("Degree of freedom:", degree_of_freedom, "\n")
 
-    # Natural-spline basis for t and z2, including their tensor interaction.
     t.basis.obj <- splines::ns(
       t.vector,
       df = degree_of_freedom
@@ -133,7 +123,6 @@ fit_mrl <- function(
 
     p_tau <- ncol(cbind(1, X_ns.test))
 
-    # Ridge penalty; do not penalize the intercept.
     penalty_factor_tau <- c(0, rep(1, p_tau - 1))
     P_tau <- diag(
       penalty_factor_tau,
@@ -162,7 +151,6 @@ fit_mrl <- function(
 
         cf_fold <- one$cfSplits
 
-        # Conditional survival under treatment 0 and 1.
         survival0 <- 1 - polspline::phare(
           t_k,
           c(one$z2, 0),
@@ -181,8 +169,6 @@ fit_mrl <- function(
           type = "response"
         ))
 
-        # Marginal survival is derived from the conditional survival model
-        # by averaging over treatment using the estimated propensity.
         survival_m <-
           (1 - pi_i) * survival0 + pi_i * survival1
 
@@ -196,7 +182,6 @@ fit_mrl <- function(
         Lambda_tk <- -log(survival_m)
         Lambda_delta <- Lambda_tk - c(0, head(Lambda_tk, -1))
 
-        # Martingale R-learner pseudo-response/design.
         y_i <- (counting - Lambda_delta) / delta_t
         w_i <- delta_t
 
@@ -224,7 +209,6 @@ fit_mrl <- function(
       list(G = G_batch, h = h_batch)
     }
 
-    # Fold-specific sufficient statistics.
     G_by_cv <- vector("list", K)
     h_by_cv <- vector("list", K)
 
@@ -249,7 +233,6 @@ fit_mrl <- function(
     G_all <- Reduce("+", G_by_cv)
     h_all <- Reduce("+", h_by_cv)
 
-    # Candidate ridge penalties.
     lambda_base <- mean(
       diag(G_all)[penalty_factor_tau == 1]
     )
@@ -264,7 +247,6 @@ fit_mrl <- function(
       length.out = 80
     )
 
-    # CV over lambda using the pseudo-loss.
     cv.score <- rep(NA_real_, length(lambda.grid))
 
     for (lambda_index in seq_along(lambda.grid)) {
@@ -321,7 +303,6 @@ fit_mrl <- function(
     )
   }
 
-  # Select the spline dimension and ridge penalty with minimum CV loss.
   best_index <- which.min(cv_result$cv_min)
   best_row <- cv_result[best_index, ]
   best_fit <- fit_by_df[[

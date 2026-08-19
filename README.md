@@ -137,7 +137,7 @@ The simulation code for the benchmark S-learner and T-learner methods is
 also provided:
 
 - [Setup A](R%20code/S%20and%20T%20learner%20for%20setup%20A.rmd)
-- [Setup B](R%20code/S%20and%20T%20learner%20for%20setup%20C%20%28Current%20B%29.rmd)
-- [Setup C](R%20code/S%20and%20T%20learner%20for%20setup%20D%20%28Current%20C%29.rmd)
-- [Setup D](R%20code/S%20and%20T%20learner%20for%20setup%20E%20%28Current%20D%29.rmd)
-- [Setup E](R%20code/S%20and%20T%20learner%20for%20complex%20lambda0%20V3.rmd)
+- [Setup B](R%20code/S%20and%20T%20learner%20for%20setup%20B.rmd)
+- [Setup C](R%20code/S%20and%20T%20learner%20for%20setup%20C.rmd)
+- [Setup D](R%20code/S%20and%20T%20learner%20for%20setup%20D.rmd)
+- [Setup E](R%20code/S%20and%20T%20learner%20for%20setup%20E.rmd)
